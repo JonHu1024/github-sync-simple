@@ -166,36 +166,43 @@ var GitHubClient = class {
     );
     return result;
   }
-  /** 下载单个文件（raw CDN，比 contents API 快） */
-  async downloadFile(path) {
-    const rawUrl = `https://raw.githubusercontent.com/${this.owner}/${this.repo}/${this.branch}/${encodePath(path)}`;
-    const resp = await fetch(rawUrl, {
-      headers: { Authorization: `Bearer ${this.token}` }
+  // ... 前面的代码保持不变 ...
+  /** 下载单个文件（使用 API 以支持私有仓库及避免 raw 域名网络问题） */
+  async downloadFile(path, sha) {
+    if (sha) {
+      const resp2 = await this.request(`/git/blobs/${sha}`, {
+        headers: { Accept: "application/vnd.github.raw" }
+      });
+      if (resp2.ok) return resp2.arrayBuffer();
+    }
+    const resp = await this.request(`/contents/${encodePath(path)}`, {
+      headers: { Accept: "application/vnd.github.raw" }
     });
     if (!resp.ok) throw new Error(`\u4E0B\u8F7D ${path} \u5931\u8D25: HTTP ${resp.status}`);
     return resp.arrayBuffer();
   }
   /** 并发批量下载，带进度回调；单文件失败会跳过，不中断整体同步 */
-  async downloadFiles(paths, onProgress) {
+  async downloadFiles(files, onProgress) {
     const result = /* @__PURE__ */ new Map();
     let done = 0;
     await pMap(
-      paths,
-      async (path) => {
+      files,
+      async (file) => {
         try {
-          const buf = await this.downloadFile(path);
-          result.set(path, buf);
+          const buf = await this.downloadFile(file.path, file.sha);
+          result.set(file.path, buf);
         } catch (err) {
-          console.warn(`\u4E0B\u8F7D ${path} \u5931\u8D25:`, err);
+          console.warn(`\u4E0B\u8F7D ${file.path} \u5931\u8D25:`, err);
         } finally {
           done++;
-          onProgress?.(done, paths.length, path);
+          onProgress?.(done, files.length, file.path);
         }
       },
       DOWNLOAD_CONCURRENCY
     );
     return result;
   }
+  // ... 后面的代码保持不变 ...
   /**
    * 批量上传（增量 Git Trees API）
    *
@@ -388,6 +395,7 @@ async function computeDiff(localFiles, remoteFiles, ignorePaths) {
   for (const [path] of localFiltered) {
     if (!remoteMap.has(path)) {
       result.toUpload.push({ path, changeType: "added" });
+      result.toRemove.push({ path, changeType: "deleted" });
     }
   }
   const commonFiles = localFiltered.filter(([path]) => remoteMap.has(path));
@@ -964,9 +972,9 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
     );
     try {
       if (toDownload.length > 0) {
-        const paths = toDownload.map((f) => f.path);
-        const downloaded = await client.downloadFiles(paths);
-        for (const path of paths) {
+        const filesToDownload = toDownload.map((f) => ({ path: f.path, sha: f.remoteSha }));
+        const downloaded = await client.downloadFiles(filesToDownload);
+        for (const { path } of filesToDownload) {
           const content = downloaded.get(path);
           if (!content) continue;
           await this.writeLocalFile(path, content);
@@ -1013,9 +1021,9 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
         }
       }
       if (downloads.length > 0) {
-        const paths = downloads.map((f) => f.path);
-        const downloaded = await client.downloadFiles(paths);
-        for (const path of paths) {
+        const filesToDownload = downloads.map((f) => ({ path: f.path, sha: f.remoteSha }));
+        const downloaded = await client.downloadFiles(filesToDownload);
+        for (const { path } of filesToDownload) {
           const content = downloaded.get(path);
           if (!content) continue;
           await this.writeLocalFile(path, content);
