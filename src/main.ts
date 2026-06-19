@@ -48,19 +48,19 @@ export default class GitHubSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "quick-push",
-			name: "快速 Push（直接显示差异确认）",
+			name: "快速 Push(直接显示差异确认)",
 			callback: () => this.startSync("push"),
 		});
 
 		this.addCommand({
 			id: "quick-pull",
-			name: "快速 Pull（直接显示差异确认）",
+			name: "快速 Pull(直接显示差异确认)",
 			callback: () => this.startSync("pull"),
 		});
 
 		this.addCommand({
 			id: "quick-smart",
-			name: "快速智能同步（按修改时间自动决定方向）",
+			name: "快速智能同步(按修改时间自动决定方向)",
 			callback: () => this.startSync("smart"),
 		});
 
@@ -69,6 +69,32 @@ export default class GitHubSyncPlugin extends Plugin {
 
 		// 注入样式
 		this.injectStyles();
+
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (file instanceof TFile) {
+					menu.addSeparator();
+					menu.addItem((item) => {
+						item
+							.setTitle("⬆️ Push 到 GitHub")
+							.setIcon("arrow-up-circle")
+							.onClick(() => this.startSync("push", file.path));
+					});
+					menu.addItem((item) => {
+						item
+							.setTitle("⬇️ 从 GitHub Pull")
+							.setIcon("arrow-down-circle")
+							.onClick(() => this.startSync("pull", file.path));
+					});
+					menu.addItem((item) => {
+						item
+							.setTitle("🔀 Smart 同步此文件")
+							.setIcon("refresh-cw")
+							.onClick(() => this.startSync("smart", file.path));
+					});
+				}
+			})
+		);
 	}
 
 	onunload() {
@@ -97,9 +123,9 @@ export default class GitHubSyncPlugin extends Plugin {
 		new SyncModeModal(this.app, (mode) => this.startSync(mode)).open();
 	}
 
-	async startSync(mode: SyncMode) {
+	async startSync(mode: SyncMode, targetPath?: string) {
 		if (this.isSyncing) {
-			new Notice("同步正在进行中，请稍候...");
+			new Notice("正在同步...(点击屏幕空白区域可以后台运行同步)");
 			return;
 		}
 		if (!this.checkConfig()) return;
@@ -118,7 +144,7 @@ export default class GitHubSyncPlugin extends Plugin {
 			const client = new GitHubClient(token, repository, branch);
 
 			// 1. 读取本地文件
-			progress.setMessage("读取本地 Vault 文件...");
+			progress.setMessage(targetPath ? `读取 ${targetPath}...` : "读取本地 Vault 文件...");
 			const local = await this.readLocalFiles(ignore);
 
 			// 2. 读取远端文件列表
@@ -127,9 +153,18 @@ export default class GitHubSyncPlugin extends Plugin {
 
 			// 3. 计算差异
 			progress.setMessage("计算差异...");
-			const diff = await computeDiff(local.files, remote.files, ignore);
+			let diff = await computeDiff(local.files, remote.files, ignore);
+			if (targetPath) {
+				diff = {
+					toUpload: diff.toUpload.filter((f) => f.path === targetPath),
+					toDelete: diff.toDelete.filter((f) => f.path === targetPath),
+					toDownload: diff.toDownload.filter((f) => f.path === targetPath),
+					toRemove: diff.toRemove.filter((f) => f.path === targetPath),
+					unchanged: diff.unchanged.filter((f) => f.path === targetPath),
+				};
+			}
 
-			// 4. 生成智能同步计划（如需要）
+			// 4. 生成智能同步计划(如需要)
 			let smartPlan: SmartSyncPlan | null = null;
 			if (mode === "smart") {
 				progress.setMessage("分析修改时间并生成智能同步计划...");
@@ -147,14 +182,14 @@ export default class GitHubSyncPlugin extends Plugin {
 					toProcess,
 					toRemove,
 					unchanged: diff.unchanged.length,
-					onConfirm: () =>
+					onConfirm: (selectedProcess, selectedRemove) =>
 						this.executePush(
 							client,
 							local.files,
 							remote.commitSha,
 							remote.treeSha,
-							toProcess,
-							toRemove
+							selectedProcess,
+							selectedRemove
 						),
 				}).open();
 			} else if (mode === "pull") {
@@ -165,8 +200,8 @@ export default class GitHubSyncPlugin extends Plugin {
 					toProcess,
 					toRemove,
 					unchanged: diff.unchanged.length,
-					onConfirm: () =>
-						this.executePull(client, toProcess, toRemove),
+					onConfirm: (selectedProcess, selectedRemove) =>
+						this.executePull(client, selectedProcess, selectedRemove),
 				}).open();
 			} else {
 				if (!smartPlan) throw new Error("智能同步计划生成失败");
@@ -175,15 +210,19 @@ export default class GitHubSyncPlugin extends Plugin {
 					toProcess: smartPlan.previewItems,
 					toRemove: [],
 					unchanged: smartPlan.unchanged,
-					onConfirm: () =>
-						this.executeSmartSync(
+					onConfirm: (selectedProcess, selectedRemove) => {
+						// 根据用户勾选的 previewItems，重新拆分出 uploads 和 downloads
+						const uploads = selectedProcess.filter((f) => f.direction === "upload");
+						const downloads = selectedProcess.filter((f) => f.direction === "download");
+						return this.executeSmartSync(
 							client,
 							local.files,
 							remote.commitSha,
 							remote.treeSha,
-							smartPlan!.uploads,
-							smartPlan!.downloads
-						),
+							uploads,
+							downloads
+						);
+					},
 				}).open();
 			}
 		} catch (err) {
@@ -344,10 +383,10 @@ export default class GitHubSyncPlugin extends Plugin {
 		try {
 			// 下载 / 覆盖文件（并发下载，顺序写入）
 			if (toDownload.length > 0) {
-				const paths = toDownload.map((f) => f.path);
-				const downloaded = await client.downloadFiles(paths);
+				const filesToDownload = toDownload.map((f) => ({ path: f.path, sha: f.remoteSha }));
+				const downloaded = await client.downloadFiles(filesToDownload);
 
-				for (const path of paths) {
+				for (const { path } of filesToDownload) {
 					const content = downloaded.get(path);
 					if (!content) continue;
 					await this.writeLocalFile(path, content);
@@ -411,9 +450,9 @@ export default class GitHubSyncPlugin extends Plugin {
 			}
 
 			if (downloads.length > 0) {
-				const paths = downloads.map((f) => f.path);
-				const downloaded = await client.downloadFiles(paths);
-				for (const path of paths) {
+				const filesToDownload = downloads.map((f) => ({ path: f.path, sha: f.remoteSha }));
+				const downloaded = await client.downloadFiles(filesToDownload);
+				for (const { path } of filesToDownload) {
 					const content = downloaded.get(path);
 					if (!content) continue;
 					await this.writeLocalFile(path, content);
@@ -594,6 +633,23 @@ const CSS = `
   margin-bottom: 20px;
 }
 
+/* 全选按钮 */
+.github-sync-select-all-btn {
+margin-bottom: 8px;
+font-size: 0.85em;
+padding: 4px 10px;
+cursor: pointer;
+border-radius: 4px;
+background: var(--background-secondary);
+border: 1px solid var(--background-modifier-border);
+color: var(--text-muted);
+transition: all 0.15s ease;
+}
+.github-sync-select-all-btn:hover {
+background: var(--background-modifier-hover);
+color: var(--text-normal);
+}
+
 /* 模式选择按钮 */
 .github-sync-mode-buttons {
   display: flex;
@@ -670,15 +726,23 @@ const CSS = `
 }
 
 .github-sync-file-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 4px;
-  border-radius: 4px;
+display: flex;
+align-items: center;
+gap: 6px;
+padding: 4px 6px;
+border-radius: 4px;
+cursor: pointer;
+user-select: none;
 }
 
 .github-sync-file-row:hover {
   background: var(--background-modifier-hover);
+}
+  
+.github-sync-file-row input[type="checkbox"] {
+margin: 0;
+cursor: pointer;
+flex-shrink: 0;
 }
 
 .file-icon { flex-shrink: 0; }

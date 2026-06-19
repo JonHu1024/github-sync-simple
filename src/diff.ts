@@ -65,6 +65,7 @@ export async function computeDiff(
 	for (const [path] of localFiltered) {
 		if (!remoteMap.has(path)) {
 			result.toUpload.push({ path, changeType: "added" });
+			result.toRemove.push({ path, changeType: "deleted" });
 		}
 	}
 

@@ -79,15 +79,20 @@ export interface ConfirmSyncOptions {
 	toProcess: FileDiff[];   // 新增/修改（smart 模式下可同时包含上传/下载项）
 	toRemove: FileDiff[];    // 删除
 	unchanged: number;
-	onConfirm: () => Promise<void>;
+	onConfirm: (selectedProcess: FileDiff[], selectedRemove: FileDiff[]) => Promise<void>;
 }
 
 export class ConfirmSyncModal extends Modal {
 	private opts: ConfirmSyncOptions;
+	private selectedProcess: Set<string>;
+	private selectedRemove: Set<string>; 
 
 	constructor(app: App, opts: ConfirmSyncOptions) {
 		super(app);
 		this.opts = opts;
+		// 默认全部勾选
+		this.selectedProcess = new Set(opts.toProcess.map((f) => f.path));
+		this.selectedRemove = new Set(opts.toRemove.map((f) => f.path));
 	}
 
 	onOpen() {
@@ -172,12 +177,33 @@ export class ConfirmSyncModal extends Modal {
 				cls: "github-sync-badge badge-unchanged",
 			});
 
+		// 新增：全选/取消全选 按钮
+		const selectAllBtn = contentEl.createEl("button", {
+			text: "取消全选",
+			cls: "github-sync-select-all-btn",
+		});
+		let isAllSelected = true;
+		selectAllBtn.addEventListener("click", () => {
+			isAllSelected = !isAllSelected;
+			if (isAllSelected) {
+				this.selectedProcess = new Set(this.opts.toProcess.map((f) => f.path));
+				this.selectedRemove = new Set(this.opts.toRemove.map((f) => f.path));
+				selectAllBtn.setText("取消全选");
+			} else {
+				this.selectedProcess.clear();
+				this.selectedRemove.clear();
+				selectAllBtn.setText("全部选中");
+			}
+			this.updateCheckboxes();
+		});
+
 		// 文件列表
 		const listContainer = contentEl.createDiv("github-sync-file-list");
 
+		// 打上标记，区分是 Process 还是 Remove
 		const allFiles = [
-			...opts.toProcess,
-			...opts.toRemove,
+			...opts.toProcess.map((f) => ({ ...f, _isRemove: false })),
+			...opts.toRemove.map((f) => ({ ...f, _isRemove: true })),
 		].sort((a, b) => a.path.localeCompare(b.path));
 
 		// 最多显示 200 行，超出折叠
@@ -186,14 +212,35 @@ export class ConfirmSyncModal extends Modal {
 
 		for (const f of displayFiles) {
 			const row = listContainer.createDiv("github-sync-file-row");
+			
+			// 新增：复选框
+			const checkbox = row.createEl("input", { type: "checkbox" });
+			checkbox.checked = f._isRemove
+				? this.selectedRemove.has(f.path)
+				: this.selectedProcess.has(f.path);
+			checkbox.dataset.path = f.path;
+			checkbox.dataset.isRemove = String(f._isRemove);
+			
+			checkbox.addEventListener("change", () => {
+				if (checkbox.checked) {
+					f._isRemove
+						? this.selectedRemove.add(f.path)
+						: this.selectedProcess.add(f.path);
+				} else {
+					f._isRemove
+						? this.selectedRemove.delete(f.path)
+						: this.selectedProcess.delete(f.path);
+				}
+			});
+
 			let icon = "";
 			let cls = "";
 			if (isSmart) {
 				if (f.direction === "upload") {
-					icon = "⬆️";
+					icon = "⬆🟢";
 					cls = f.changeType === "modified" ? "file-modified" : "file-added";
 				} else if (f.direction === "download") {
-					icon = "⬇️";
+					icon = "⬇🔵";
 					cls = f.changeType === "modified" ? "file-modified" : "file-added";
 				} else if (f.direction === "delete") {
 					icon = "🗑️";
@@ -213,6 +260,15 @@ export class ConfirmSyncModal extends Modal {
 			}
 			row.createEl("span", { text: icon, cls: "file-icon" });
 			row.createEl("span", { text: f.path, cls: `file-path ${cls}` });
+
+			// 点击整行也可以切换选中状态
+			row.addEventListener("click", (e) => {
+				if (e.target !== checkbox) {
+					checkbox.checked = !checkbox.checked;
+					checkbox.dispatchEvent(new Event("change"));
+				}
+			});
+
 		}
 
 		if (hasMore) {
@@ -244,12 +300,41 @@ export class ConfirmSyncModal extends Modal {
 					.setButtonText(`确认${modeLabel}`)
 					.setCta()
 					.onClick(async () => {
+						// 过滤出选中的文件
+						const sp = this.opts.toProcess.filter((f) =>
+							this.selectedProcess.has(f.path)
+						);
+						const sr = this.opts.toRemove.filter((f) =>
+							this.selectedRemove.has(f.path)
+						);
+
+						if (sp.length === 0 && sr.length === 0) {
+							new Notice("⚠️ 未选择任何文件");
+							return;
+						}
+
 						btn.setDisabled(true);
 						btn.setButtonText("同步中...");
-						await opts.onConfirm();
+						await opts.onConfirm(sp, sr);
 						this.close();
 					})
 			);
+	}
+
+	private updateCheckboxes() {
+		const checkboxes =
+			this.contentEl.querySelectorAll<HTMLInputElement>(
+				'input[type="checkbox"]'
+			);
+		checkboxes.forEach((cb) => {
+			const path = cb.dataset.path;
+			const isRemove = cb.dataset.isRemove === "true";
+			if (path) {
+				cb.checked = isRemove
+					? this.selectedRemove.has(path)
+					: this.selectedProcess.has(path);
+			}
+		});
 	}
 
 	onClose() {

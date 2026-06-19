@@ -204,40 +204,51 @@ export class GitHubClient {
 		return result;
 	}
 
-	/** 下载单个文件（raw CDN，比 contents API 快） */
-	async downloadFile(path: string): Promise<ArrayBuffer> {
-		const rawUrl = `https://raw.githubusercontent.com/${this.owner}/${this.repo}/${this.branch}/${encodePath(path)}`;
-		const resp = await fetch(rawUrl, {
-			headers: { Authorization: `Bearer ${this.token}` },
-		});
-		if (!resp.ok) throw new Error(`下载 ${path} 失败: HTTP ${resp.status}`);
-		return resp.arrayBuffer();
-	}
+	// ... 前面的代码保持不变 ...
 
-	/** 并发批量下载，带进度回调；单文件失败会跳过，不中断整体同步 */
-	async downloadFiles(
-		paths: string[],
-		onProgress?: (done: number, total: number, currentPath: string) => void
-	): Promise<Map<string, ArrayBuffer>> {
-		const result = new Map<string, ArrayBuffer>();
-		let done = 0;
-		await pMap(
-			paths,
-			async (path) => {
-				try {
-					const buf = await this.downloadFile(path);
-					result.set(path, buf);
-				} catch (err) {
-					console.warn(`下载 ${path} 失败:`, err);
-				} finally {
-					done++;
-					onProgress?.(done, paths.length, path);
-				}
-			},
-			DOWNLOAD_CONCURRENCY
-		);
-		return result;
+/** 下载单个文件（使用 API 以支持私有仓库及避免 raw 域名网络问题） */
+async downloadFile(path: string, sha?: string): Promise<ArrayBuffer> {
+	// 优先使用 Blob API（无 1MB 大小限制，且支持私有仓库鉴权）
+	if (sha) {
+		const resp = await this.request(`/git/blobs/${sha}`, {
+			headers: { Accept: "application/vnd.github.raw" },
+		});
+		if (resp.ok) return resp.arrayBuffer();
 	}
+	// 回退到 Contents API（兜底）
+	const resp = await this.request(`/contents/${encodePath(path)}`, {
+		headers: { Accept: "application/vnd.github.raw" },
+	});
+	if (!resp.ok) throw new Error(`下载 ${path} 失败: HTTP ${resp.status}`);
+	return resp.arrayBuffer();
+}
+
+/** 并发批量下载，带进度回调；单文件失败会跳过，不中断整体同步 */
+async downloadFiles(
+	files: { path: string; sha?: string }[],
+	onProgress?: (done: number, total: number, currentPath: string) => void
+): Promise<Map<string, ArrayBuffer>> {
+	const result = new Map<string, ArrayBuffer>();
+	let done = 0;
+	await pMap(
+		files,
+		async (file) => {
+			try {
+				const buf = await this.downloadFile(file.path, file.sha);
+				result.set(file.path, buf);
+			} catch (err) {
+				console.warn(`下载 ${file.path} 失败:`, err);
+			} finally {
+				done++;
+				onProgress?.(done, files.length, file.path);
+			}
+		},
+		DOWNLOAD_CONCURRENCY
+	);
+	return result;
+}
+
+// ... 后面的代码保持不变 ...
 
 	/**
 	 * 批量上传（增量 Git Trees API）
