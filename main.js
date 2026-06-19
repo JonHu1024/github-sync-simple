@@ -534,6 +534,8 @@ var ConfirmSyncModal = class extends import_obsidian.Modal {
   constructor(app, opts) {
     super(app);
     this.opts = opts;
+    this.selectedProcess = new Set(opts.toProcess.map((f) => f.path));
+    this.selectedRemove = new Set(opts.toRemove.map((f) => f.path));
   }
   onOpen() {
     const { contentEl, opts } = this;
@@ -602,23 +604,52 @@ var ConfirmSyncModal = class extends import_obsidian.Modal {
         text: `\uFF1D ${opts.unchanged} \u4E2A\u672A\u53D8\u5316`,
         cls: "github-sync-badge badge-unchanged"
       });
+    const selectAllBtn = contentEl.createEl("button", {
+      text: "\u53D6\u6D88\u5168\u9009",
+      cls: "github-sync-select-all-btn"
+    });
+    let isAllSelected = true;
+    selectAllBtn.addEventListener("click", () => {
+      isAllSelected = !isAllSelected;
+      if (isAllSelected) {
+        this.selectedProcess = new Set(this.opts.toProcess.map((f) => f.path));
+        this.selectedRemove = new Set(this.opts.toRemove.map((f) => f.path));
+        selectAllBtn.setText("\u53D6\u6D88\u5168\u9009");
+      } else {
+        this.selectedProcess.clear();
+        this.selectedRemove.clear();
+        selectAllBtn.setText("\u5168\u90E8\u9009\u4E2D");
+      }
+      this.updateCheckboxes();
+    });
     const listContainer = contentEl.createDiv("github-sync-file-list");
     const allFiles = [
-      ...opts.toProcess,
-      ...opts.toRemove
+      ...opts.toProcess.map((f) => ({ ...f, _isRemove: false })),
+      ...opts.toRemove.map((f) => ({ ...f, _isRemove: true }))
     ].sort((a, b) => a.path.localeCompare(b.path));
     const displayFiles = allFiles.slice(0, 200);
     const hasMore = allFiles.length > 200;
     for (const f of displayFiles) {
       const row = listContainer.createDiv("github-sync-file-row");
+      const checkbox = row.createEl("input", { type: "checkbox" });
+      checkbox.checked = f._isRemove ? this.selectedRemove.has(f.path) : this.selectedProcess.has(f.path);
+      checkbox.dataset.path = f.path;
+      checkbox.dataset.isRemove = String(f._isRemove);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) {
+          f._isRemove ? this.selectedRemove.add(f.path) : this.selectedProcess.add(f.path);
+        } else {
+          f._isRemove ? this.selectedRemove.delete(f.path) : this.selectedProcess.delete(f.path);
+        }
+      });
       let icon = "";
       let cls = "";
       if (isSmart) {
         if (f.direction === "upload") {
-          icon = "\u2B06\uFE0F";
+          icon = "\u2B06\u{1F7E2}";
           cls = f.changeType === "modified" ? "file-modified" : "file-added";
         } else if (f.direction === "download") {
-          icon = "\u2B07\uFE0F";
+          icon = "\u2B07\u{1F535}";
           cls = f.changeType === "modified" ? "file-modified" : "file-added";
         } else if (f.direction === "delete") {
           icon = "\u{1F5D1}\uFE0F";
@@ -638,6 +669,12 @@ var ConfirmSyncModal = class extends import_obsidian.Modal {
       }
       row.createEl("span", { text: icon, cls: "file-icon" });
       row.createEl("span", { text: f.path, cls: `file-path ${cls}` });
+      row.addEventListener("click", (e) => {
+        if (e.target !== checkbox) {
+          checkbox.checked = !checkbox.checked;
+          checkbox.dispatchEvent(new Event("change"));
+        }
+      });
     }
     if (hasMore) {
       listContainer.createEl("p", {
@@ -654,12 +691,34 @@ var ConfirmSyncModal = class extends import_obsidian.Modal {
       (btn) => btn.setButtonText("\u53D6\u6D88").onClick(() => this.close())
     ).addButton(
       (btn) => btn.setButtonText(`\u786E\u8BA4${modeLabel}`).setCta().onClick(async () => {
+        const sp = this.opts.toProcess.filter(
+          (f) => this.selectedProcess.has(f.path)
+        );
+        const sr = this.opts.toRemove.filter(
+          (f) => this.selectedRemove.has(f.path)
+        );
+        if (sp.length === 0 && sr.length === 0) {
+          new Notice("\u26A0\uFE0F \u672A\u9009\u62E9\u4EFB\u4F55\u6587\u4EF6");
+          return;
+        }
         btn.setDisabled(true);
         btn.setButtonText("\u540C\u6B65\u4E2D...");
-        await opts.onConfirm();
+        await opts.onConfirm(sp, sr);
         this.close();
       })
     );
+  }
+  updateCheckboxes() {
+    const checkboxes = this.contentEl.querySelectorAll(
+      'input[type="checkbox"]'
+    );
+    checkboxes.forEach((cb) => {
+      const path = cb.dataset.path;
+      const isRemove = cb.dataset.isRemove === "true";
+      if (path) {
+        cb.checked = isRemove ? this.selectedRemove.has(path) : this.selectedProcess.has(path);
+      }
+    });
   }
   onClose() {
     this.contentEl.empty();
@@ -760,21 +819,37 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
     });
     this.addCommand({
       id: "quick-push",
-      name: "\u5FEB\u901F Push\uFF08\u76F4\u63A5\u663E\u793A\u5DEE\u5F02\u786E\u8BA4\uFF09",
+      name: "\u5FEB\u901F Push(\u76F4\u63A5\u663E\u793A\u5DEE\u5F02\u786E\u8BA4)",
       callback: () => this.startSync("push")
     });
     this.addCommand({
       id: "quick-pull",
-      name: "\u5FEB\u901F Pull\uFF08\u76F4\u63A5\u663E\u793A\u5DEE\u5F02\u786E\u8BA4\uFF09",
+      name: "\u5FEB\u901F Pull(\u76F4\u63A5\u663E\u793A\u5DEE\u5F02\u786E\u8BA4)",
       callback: () => this.startSync("pull")
     });
     this.addCommand({
       id: "quick-smart",
-      name: "\u5FEB\u901F\u667A\u80FD\u540C\u6B65\uFF08\u6309\u4FEE\u6539\u65F6\u95F4\u81EA\u52A8\u51B3\u5B9A\u65B9\u5411\uFF09",
+      name: "\u5FEB\u901F\u667A\u80FD\u540C\u6B65(\u6309\u4FEE\u6539\u65F6\u95F4\u81EA\u52A8\u51B3\u5B9A\u65B9\u5411)",
       callback: () => this.startSync("smart")
     });
     this.addSettingTab(new GitHubSyncSettingTab(this.app, this));
     this.injectStyles();
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (file instanceof import_obsidian3.TFile) {
+          menu.addSeparator();
+          menu.addItem((item) => {
+            item.setTitle("\u2B06\uFE0F Push \u5230 GitHub").setIcon("arrow-up-circle").onClick(() => this.startSync("push", file.path));
+          });
+          menu.addItem((item) => {
+            item.setTitle("\u2B07\uFE0F \u4ECE GitHub Pull").setIcon("arrow-down-circle").onClick(() => this.startSync("pull", file.path));
+          });
+          menu.addItem((item) => {
+            item.setTitle("\u{1F500} Smart \u540C\u6B65\u6B64\u6587\u4EF6").setIcon("refresh-cw").onClick(() => this.startSync("smart", file.path));
+          });
+        }
+      })
+    );
   }
   onunload() {
     const style = document.getElementById("github-sync-styles");
@@ -797,9 +872,9 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
     if (!this.checkConfig()) return;
     new SyncModeModal(this.app, (mode) => this.startSync(mode)).open();
   }
-  async startSync(mode) {
+  async startSync(mode, targetPath) {
     if (this.isSyncing) {
-      new import_obsidian3.Notice("\u540C\u6B65\u6B63\u5728\u8FDB\u884C\u4E2D\uFF0C\u8BF7\u7A0D\u5019...");
+      new import_obsidian3.Notice("\u6B63\u5728\u540C\u6B65...(\u70B9\u51FB\u5C4F\u5E55\u7A7A\u767D\u533A\u57DF\u53EF\u4EE5\u540E\u53F0\u8FD0\u884C\u540C\u6B65)");
       return;
     }
     if (!this.checkConfig()) return;
@@ -810,12 +885,21 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
       const { token, repository, branch, ignorePaths } = this.settings;
       const ignore = ignorePaths.split("\n").map((s) => s.trim()).filter(Boolean);
       const client = new GitHubClient(token, repository, branch);
-      progress.setMessage("\u8BFB\u53D6\u672C\u5730 Vault \u6587\u4EF6...");
+      progress.setMessage(targetPath ? `\u8BFB\u53D6 ${targetPath}...` : "\u8BFB\u53D6\u672C\u5730 Vault \u6587\u4EF6...");
       const local = await this.readLocalFiles(ignore);
       progress.setMessage("\u83B7\u53D6 GitHub \u6587\u4EF6\u5217\u8868...");
       const remote = await client.listAllFiles();
       progress.setMessage("\u8BA1\u7B97\u5DEE\u5F02...");
-      const diff = await computeDiff(local.files, remote.files, ignore);
+      let diff = await computeDiff(local.files, remote.files, ignore);
+      if (targetPath) {
+        diff = {
+          toUpload: diff.toUpload.filter((f) => f.path === targetPath),
+          toDelete: diff.toDelete.filter((f) => f.path === targetPath),
+          toDownload: diff.toDownload.filter((f) => f.path === targetPath),
+          toRemove: diff.toRemove.filter((f) => f.path === targetPath),
+          unchanged: diff.unchanged.filter((f) => f.path === targetPath)
+        };
+      }
       let smartPlan = null;
       if (mode === "smart") {
         progress.setMessage("\u5206\u6790\u4FEE\u6539\u65F6\u95F4\u5E76\u751F\u6210\u667A\u80FD\u540C\u6B65\u8BA1\u5212...");
@@ -830,13 +914,13 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
           toProcess,
           toRemove,
           unchanged: diff.unchanged.length,
-          onConfirm: () => this.executePush(
+          onConfirm: (selectedProcess, selectedRemove) => this.executePush(
             client,
             local.files,
             remote.commitSha,
             remote.treeSha,
-            toProcess,
-            toRemove
+            selectedProcess,
+            selectedRemove
           )
         }).open();
       } else if (mode === "pull") {
@@ -847,7 +931,7 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
           toProcess,
           toRemove,
           unchanged: diff.unchanged.length,
-          onConfirm: () => this.executePull(client, toProcess, toRemove)
+          onConfirm: (selectedProcess, selectedRemove) => this.executePull(client, selectedProcess, selectedRemove)
         }).open();
       } else {
         if (!smartPlan) throw new Error("\u667A\u80FD\u540C\u6B65\u8BA1\u5212\u751F\u6210\u5931\u8D25");
@@ -856,14 +940,18 @@ var GitHubSyncPlugin = class extends import_obsidian3.Plugin {
           toProcess: smartPlan.previewItems,
           toRemove: [],
           unchanged: smartPlan.unchanged,
-          onConfirm: () => this.executeSmartSync(
-            client,
-            local.files,
-            remote.commitSha,
-            remote.treeSha,
-            smartPlan.uploads,
-            smartPlan.downloads
-          )
+          onConfirm: (selectedProcess, selectedRemove) => {
+            const uploads = selectedProcess.filter((f) => f.direction === "upload");
+            const downloads = selectedProcess.filter((f) => f.direction === "download");
+            return this.executeSmartSync(
+              client,
+              local.files,
+              remote.commitSha,
+              remote.treeSha,
+              uploads,
+              downloads
+            );
+          }
         }).open();
       }
     } catch (err) {
@@ -1174,6 +1262,23 @@ var CSS = `
   margin-bottom: 20px;
 }
 
+/* \u5168\u9009\u6309\u94AE */
+.github-sync-select-all-btn {
+margin-bottom: 8px;
+font-size: 0.85em;
+padding: 4px 10px;
+cursor: pointer;
+border-radius: 4px;
+background: var(--background-secondary);
+border: 1px solid var(--background-modifier-border);
+color: var(--text-muted);
+transition: all 0.15s ease;
+}
+.github-sync-select-all-btn:hover {
+background: var(--background-modifier-hover);
+color: var(--text-normal);
+}
+
 /* \u6A21\u5F0F\u9009\u62E9\u6309\u94AE */
 .github-sync-mode-buttons {
   display: flex;
@@ -1250,15 +1355,23 @@ var CSS = `
 }
 
 .github-sync-file-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 4px;
-  border-radius: 4px;
+display: flex;
+align-items: center;
+gap: 6px;
+padding: 4px 6px;
+border-radius: 4px;
+cursor: pointer;
+user-select: none;
 }
 
 .github-sync-file-row:hover {
   background: var(--background-modifier-hover);
+}
+  
+.github-sync-file-row input[type="checkbox"] {
+margin: 0;
+cursor: pointer;
+flex-shrink: 0;
 }
 
 .file-icon { flex-shrink: 0; }
