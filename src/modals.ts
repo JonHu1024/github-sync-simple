@@ -79,13 +79,14 @@ export interface ConfirmSyncOptions {
 	toProcess: FileDiff[];   // 新增/修改（smart 模式下可同时包含上传/下载项）
 	toRemove: FileDiff[];    // 删除
 	unchanged: number;
+	// 修改：接收用户勾选后的文件列表
 	onConfirm: (selectedProcess: FileDiff[], selectedRemove: FileDiff[]) => Promise<void>;
 }
 
 export class ConfirmSyncModal extends Modal {
 	private opts: ConfirmSyncOptions;
 	private selectedProcess: Set<string>;
-	private selectedRemove: Set<string>; 
+	private selectedRemove: Set<string>;
 
 	constructor(app: App, opts: ConfirmSyncOptions) {
 		super(app);
@@ -105,8 +106,8 @@ export class ConfirmSyncModal extends Modal {
 			opts.mode === "push"
 				? "Push ⬆️"
 				: opts.mode === "pull"
-					? "Pull ⬇️"
-					: "智能同步 🔀";
+				? "Pull ⬇️"
+				: "智能同步 🔀";
 		contentEl.createEl("h2", { text: `确认${modeLabel}` });
 
 		const total = opts.toProcess.length + opts.toRemove.length;
@@ -124,51 +125,21 @@ export class ConfirmSyncModal extends Modal {
 		// 统计摘要
 		const summary = contentEl.createDiv("github-sync-summary");
 		if (isSmart) {
-			const uploadCount = opts.toProcess.filter(
-				(f) => f.direction === "upload"
-			).length;
-			const downloadCount = opts.toProcess.filter(
-				(f) => f.direction === "download"
-			).length;
-			const deleteCount =
-				opts.toRemove.length +
-				opts.toProcess.filter((f) => f.direction === "delete").length;
+			const uploadCount = opts.toProcess.filter((f) => f.direction === "upload").length;
+			const downloadCount = opts.toProcess.filter((f) => f.direction === "download").length;
+			const deleteCount = opts.toRemove.length + opts.toProcess.filter((f) => f.direction === "delete").length;
 
-			if (uploadCount > 0)
-				summary.createEl("span", {
-					text: `⬆️ ${uploadCount} 个上传`,
-					cls: "github-sync-badge badge-added",
-				});
-			if (downloadCount > 0)
-				summary.createEl("span", {
-					text: `⬇️ ${downloadCount} 个下载`,
-					cls: "github-sync-badge badge-modified",
-				});
-			if (deleteCount > 0)
-				summary.createEl("span", {
-					text: `🗑️ ${deleteCount} 个删除`,
-					cls: "github-sync-badge badge-deleted",
-				});
+			if (uploadCount > 0) summary.createEl("span", { text: `⬆️ ${uploadCount} 个上传`, cls: "github-sync-badge badge-upload" });
+			if (downloadCount > 0) summary.createEl("span", { text: `⬇️ ${downloadCount} 个下载`, cls: "github-sync-badge badge-download" });
+			if (deleteCount > 0) summary.createEl("span", { text: `🗑️ ${deleteCount} 个删除`, cls: "github-sync-badge badge-deleted" });
 		} else {
 			const added = opts.toProcess.filter((f) => f.changeType === "added").length;
 			const modified = opts.toProcess.filter((f) => f.changeType === "modified").length;
 			const deleted = opts.toRemove.length;
 
-			if (added > 0)
-				summary.createEl("span", {
-					text: `➕ ${added} 个新增`,
-					cls: "github-sync-badge badge-added",
-				});
-			if (modified > 0)
-				summary.createEl("span", {
-					text: `✏️ ${modified} 个修改`,
-					cls: "github-sync-badge badge-modified",
-				});
-			if (deleted > 0)
-				summary.createEl("span", {
-					text: `🗑️ ${deleted} 个删除`,
-					cls: "github-sync-badge badge-deleted",
-				});
+			if (added > 0) summary.createEl("span", { text: `➕ ${added} 个新增`, cls: "github-sync-badge badge-added" });
+			if (modified > 0) summary.createEl("span", { text: `✏️ ${modified} 个修改`, cls: "github-sync-badge badge-modified" });
+			if (deleted > 0) summary.createEl("span", { text: `🗑️ ${deleted} 个删除`, cls: "github-sync-badge badge-deleted" });
 		}
 
 		if (opts.unchanged > 0)
@@ -223,41 +194,50 @@ export class ConfirmSyncModal extends Modal {
 			
 			checkbox.addEventListener("change", () => {
 				if (checkbox.checked) {
-					f._isRemove
-						? this.selectedRemove.add(f.path)
-						: this.selectedProcess.add(f.path);
+					f._isRemove ? this.selectedRemove.add(f.path) : this.selectedProcess.add(f.path);
 				} else {
-					f._isRemove
-						? this.selectedRemove.delete(f.path)
-						: this.selectedProcess.delete(f.path);
+					f._isRemove ? this.selectedRemove.delete(f.path) : this.selectedProcess.delete(f.path);
 				}
 			});
 
-			let icon = "";
-			let cls = "";
+			// 核心重构：根据模式和方向决定图标与颜色
+			let icon = " ";
+			let cls = " ";
 			if (isSmart) {
 				if (f.direction === "upload") {
-					icon = "⬆🟢";
-					cls = f.changeType === "modified" ? "file-modified" : "file-added";
+					icon = "⬆️";
+					cls = "file-upload";   // 蓝色：上传
 				} else if (f.direction === "download") {
-					icon = "⬇🔵";
-					cls = f.changeType === "modified" ? "file-modified" : "file-added";
+					icon = "⬇️";
+					cls = "file-download"; // 绿色：下载
 				} else if (f.direction === "delete") {
 					icon = "🗑️";
-					cls = "file-deleted";
+					cls = "file-deleted";  // 红色：删除
 				}
-			} else {
+			} else if (opts.mode === "push") {
 				if (f.changeType === "added") {
 					icon = "➕";
-					cls = "file-added";
+					cls = "file-added";    // 绿色：新增
 				} else if (f.changeType === "modified") {
 					icon = "✏️";
-					cls = "file-modified";
+					cls = "file-modified"; // 橙色：修改
 				} else if (f.changeType === "deleted") {
 					icon = "🗑️";
-					cls = "file-deleted";
+					cls = "file-deleted";  // 红色：删除
+				}
+			} else if (opts.mode === "pull") {
+				if (f.changeType === "added") {
+					icon = "⬇️";
+					cls = "file-download"; // 绿色：下载新文件
+				} else if (f.changeType === "modified") {
+					icon = "⬇️✏️";
+					cls = "file-modified"; // 橙色：下载修改
+				} else if (f.changeType === "deleted") {
+					icon = "🗑️";
+					cls = "file-deleted";  // 红色：本地删除
 				}
 			}
+
 			row.createEl("span", { text: icon, cls: "file-icon" });
 			row.createEl("span", { text: f.path, cls: `file-path ${cls}` });
 
@@ -268,7 +248,6 @@ export class ConfirmSyncModal extends Modal {
 					checkbox.dispatchEvent(new Event("change"));
 				}
 			});
-
 		}
 
 		if (hasMore) {
@@ -282,8 +261,8 @@ export class ConfirmSyncModal extends Modal {
 			opts.mode === "push"
 				? "上传到 GitHub"
 				: opts.mode === "pull"
-					? "覆盖本地文件"
-					: "按最新修改时间同步";
+				? "覆盖本地文件"
+				: "按最新修改时间同步";
 		contentEl.createEl("p", {
 			text: `确认后将直接${actionWord}，操作不可撤销。`,
 			cls: "github-sync-warning",
@@ -291,9 +270,7 @@ export class ConfirmSyncModal extends Modal {
 
 		new Setting(contentEl)
 			.addButton((btn) =>
-				btn
-					.setButtonText("取消")
-					.onClick(() => this.close())
+				btn.setButtonText("取消").onClick(() => this.close())
 			)
 			.addButton((btn) =>
 				btn
@@ -301,12 +278,8 @@ export class ConfirmSyncModal extends Modal {
 					.setCta()
 					.onClick(async () => {
 						// 过滤出选中的文件
-						const sp = this.opts.toProcess.filter((f) =>
-							this.selectedProcess.has(f.path)
-						);
-						const sr = this.opts.toRemove.filter((f) =>
-							this.selectedRemove.has(f.path)
-						);
+						const sp = this.opts.toProcess.filter((f) => this.selectedProcess.has(f.path));
+						const sr = this.opts.toRemove.filter((f) => this.selectedRemove.has(f.path));
 
 						if (sp.length === 0 && sr.length === 0) {
 							new Notice("⚠️ 未选择任何文件");
@@ -322,17 +295,12 @@ export class ConfirmSyncModal extends Modal {
 	}
 
 	private updateCheckboxes() {
-		const checkboxes =
-			this.contentEl.querySelectorAll<HTMLInputElement>(
-				'input[type="checkbox"]'
-			);
+		const checkboxes = this.contentEl.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
 		checkboxes.forEach((cb) => {
 			const path = cb.dataset.path;
 			const isRemove = cb.dataset.isRemove === "true";
 			if (path) {
-				cb.checked = isRemove
-					? this.selectedRemove.has(path)
-					: this.selectedProcess.has(path);
+				cb.checked = isRemove ? this.selectedRemove.has(path) : this.selectedProcess.has(path);
 			}
 		});
 	}
@@ -383,6 +351,66 @@ export class ProgressModal extends Modal {
 	setProgress(pct: number) {
 		if (this.progressBarEl)
 			this.progressBarEl.style.width = `${Math.min(100, pct)}%`;
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+// 新增：未同步警告弹窗
+export class UnsyncedWarningModal extends Modal {
+	private paths: string[];
+	private onSync: () => void;
+
+	constructor(app: App, paths: string[], onSync: () => void) {
+		super(app);
+		this.paths = paths;
+		this.onSync = onSync;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass("github-sync-modal");
+
+		contentEl.createEl("h2", { text: "⚠️ 发现未同步的修改" });
+		contentEl.createEl("p", {
+			text: "上次退出 Obsidian 时没有同步。再次执行包含拉取 (Pull/Smart) 的操作请小心，以免覆盖本地未保存的修改。",
+			cls: "github-sync-warning",
+		});
+
+		if (this.paths.length > 0) {
+			contentEl.createEl("p", { text: "以下文件可能未同步：" });
+			const listContainer = contentEl.createDiv("github-sync-file-list");
+			// 最多显示 50 个
+			const displayPaths = this.paths.slice(0, 50);
+			for (const p of displayPaths) {
+				const row = listContainer.createDiv("github-sync-file-row");
+				row.createEl("span", { text: "📝", cls: "file-icon" });
+				row.createEl("span", { text: p, cls: "file-path file-modified" });
+			}
+			if (this.paths.length > 50) {
+				listContainer.createEl("p", {
+					text: `...以及 ${this.paths.length - 50} 个其他文件`,
+					cls: "github-sync-more",
+				});
+			}
+		}
+
+		new Setting(contentEl)
+			.addButton((btn) =>
+				btn.setButtonText("我知道了").onClick(() => this.close())
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("立即查看/同步")
+					.setCta()
+					.onClick(() => {
+						this.close();
+						this.onSync();
+					})
+			);
 	}
 
 	onClose() {

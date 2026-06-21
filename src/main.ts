@@ -8,6 +8,7 @@ import {
 	ProgressModal,
 	SyncMode,
 	SyncModeModal,
+	UnsyncedWarningModal,
 } from "./modals";
 import {
 	DEFAULT_SETTINGS,
@@ -30,9 +31,32 @@ interface SmartSyncPlan {
 export default class GitHubSyncPlugin extends Plugin {
 	settings!: GitHubSyncSettings;
 	private isSyncing = false;
+	private isDirty = false; // 最终是否有未同步的修改
+	private statusBarEl!: HTMLElement; // 状态栏元素
+	// 新增：用于记录未同步文件和防抖保存
+	private unsyncedPaths = new Set<string>();
+	private saveStateTimer: number | null = null;
+	private recentlySyncedPaths = new Set<string>();// 冷却池：防止同步写入触发的 modify 被误判
 
 	async onload() {
 		await this.loadSettings();
+
+		// 正常用户不可能一次退出前手动改了 10 个以上的文件还没同步。如果超过 10 个，绝对是之前启动风暴导致的脏数据，直接清空！
+		if (this.settings.lastUnsyncedPaths && this.settings.lastUnsyncedPaths.length > 10) {
+			this.settings.lastUnsyncedPaths = [];
+			this.settings.hasUnsyncedChanges = false;
+			await this.saveSettings();
+		}
+
+		// 恢复内存中的未同步集合
+		if (this.settings.hasUnsyncedChanges) {
+			this.isDirty = true;
+			this.settings.lastUnsyncedPaths.forEach(p => this.unsyncedPaths.add(p));
+		}
+
+		//初始化状态栏
+		this.statusBarEl = this.addStatusBarItem();
+		this.updateStatusBar();
 
 		// 左侧边栏图标
 		this.addRibbonIcon("github", "GitHub Sync", () => {
@@ -48,13 +72,13 @@ export default class GitHubSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: "quick-push",
-			name: "快速 Push(直接显示差异确认)",
+			name: "Quick Push(直接显示差异确认)",
 			callback: () => this.startSync("push"),
 		});
 
 		this.addCommand({
 			id: "quick-pull",
-			name: "快速 Pull(直接显示差异确认)",
+			name: "Quick Pull(直接显示差异确认)",
 			callback: () => this.startSync("pull"),
 		});
 
@@ -70,36 +94,123 @@ export default class GitHubSyncPlugin extends Plugin {
 		// 注入样式
 		this.injectStyles();
 
-		this.registerEvent(
-			this.app.workspace.on("file-menu", (menu, file) => {
-				if (file instanceof TFile) {
-					menu.addSeparator();
-					menu.addItem((item) => {
-						item
-							.setTitle("⬆️ Push 到 GitHub")
-							.setIcon("arrow-up-circle")
-							.onClick(() => this.startSync("push", file.path));
-					});
-					menu.addItem((item) => {
-						item
-							.setTitle("⬇️ 从 GitHub Pull")
-							.setIcon("arrow-down-circle")
-							.onClick(() => this.startSync("pull", file.path));
-					});
-					menu.addItem((item) => {
-						item
-							.setTitle("🔀 Smart 同步此文件")
-							.setIcon("refresh-cw")
-							.onClick(() => this.startSync("smart", file.path));
-					});
-				}
-			})
-		);
+		//等待 Obsidian 完全启动、UI 渲染完毕后，再注册监听
+		this.app.workspace.onLayoutReady(() => {
+			let isBooting = true;
+			// 5秒免疫期：防止其他插件在启动后异步写入配置文件
+			setTimeout(() => { isBooting = false; }, 5000);
+
+			const markDirty = (file: TAbstractFile) => {
+				if (isBooting) return; // 免疫期内无视一切
+				if (this.isSyncing) return;
+				if (!(file instanceof TFile)) return;
+				
+				// 硬编码无视 .obsidian 目录
+				// 用户的笔记修改才需要提醒，配置文件的变动不应污染“未同步名单”
+				if (file.path.startsWith('.obsidian/') || file.path === '.obsidian') return;
+				
+				if (this.recentlySyncedPaths.has(file.path)) return;
+
+				this.unsyncedPaths.add(file.path);
+				this.setDirty(true);
+				this.debounceSaveState();
+			};
+			this.registerEvent(this.app.vault.on("modify", markDirty));
+			this.registerEvent(this.app.vault.on("create", markDirty));
+			this.registerEvent(this.app.vault.on("delete", markDirty));
+			this.registerEvent(this.app.vault.on("rename", (file) => {
+				if (file instanceof TFile) markDirty(file);
+			}));
+			this.registerEvent(
+				this.app.workspace.on("file-menu", (menu, file) => {
+					if (file instanceof TFile) {
+						menu.addSeparator();
+						menu.addItem((item) => {
+							item
+								.setTitle("Push To GitHub")
+								.setIcon("arrow-up-circle")
+								.onClick(() => this.startSync("push", file.path));
+						});
+						menu.addItem((item) => {
+							item
+								.setTitle("Pull From GitHub")
+								.setIcon("arrow-down-circle")
+								.onClick(() => this.startSync("pull", file.path));
+						});
+						menu.addItem((item) => {
+							item
+								.setTitle("Smart Push/Pull")
+								.setIcon("refresh-cw")
+								.onClick(() => this.startSync("smart", file.path));
+						});
+					}
+				})
+			);
+		});
+
+		// 新增：启动时检查并弹出警告
+		if (this.settings.showUnsyncedWarningOnStartup && this.settings.hasUnsyncedChanges) {
+			setTimeout(() => {
+				new UnsyncedWarningModal(
+					this.app,
+					this.settings.lastUnsyncedPaths || [],
+					() => this.openSyncModal()
+				).open();
+			}, 800);//延迟0.8s防止与启动动画冲突
+		}
 	}
 
 	onunload() {
 		const style = document.getElementById("github-sync-styles");
 		if (style) style.remove();
+	}
+
+	// 新增：防抖保存状态到 data.json (5秒内无新修改才写入，避免卡顿)
+	private debounceSaveState() {
+		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
+		this.saveStateTimer = window.setTimeout(async () => {
+			this.settings.hasUnsyncedChanges = this.isDirty;
+			this.settings.lastUnsyncedPaths = Array.from(this.unsyncedPaths);
+			await this.saveSettings();
+		}, 5*1000);
+	}
+
+	// 新增：彻底清理未同步状态（同步成功后调用）
+	private async clearDirtyState() {
+		this.isDirty = false;
+		this.unsyncedPaths.clear();
+		this.settings.hasUnsyncedChanges = false;
+		this.settings.lastUnsyncedPaths = [];
+		if (this.saveStateTimer) window.clearTimeout(this.saveStateTimer);
+		await this.saveSettings(); // 立即保存
+		this.updateStatusBar();
+	}
+
+	// 修改原有的 setDirty，使其与持久化状态同步
+	private setDirty(dirty: boolean) {
+		if (this.isDirty !== dirty) {
+			this.isDirty = dirty;
+			this.updateStatusBar();
+			// 如果变为 false，也触发一次保存（清理记录）
+			if (!dirty) this.debounceSaveState();
+		}
+	}
+
+	// 新增：更新状态栏 UI
+	private updateStatusBar() {
+		if (this.isDirty) {
+			this.statusBarEl.setText("⚠️GitHub未同步");
+			this.statusBarEl.style.color = "var(--text-warning, #e6922a)";
+			this.statusBarEl.style.cursor = "pointer";
+			this.statusBarEl.title = "点击立即同步";
+			this.statusBarEl.onclick = () => this.openSyncModal();
+		} else {
+			this.statusBarEl.setText("✅GitHub已同步");
+			this.statusBarEl.style.color = "var(--text-success, #28a745)";
+			this.statusBarEl.style.cursor = "default";
+			this.statusBarEl.title = "";
+			this.statusBarEl.onclick = null;
+		}
 	}
 
 	async loadSettings() {
@@ -124,13 +235,13 @@ export default class GitHubSyncPlugin extends Plugin {
 	}
 
 	async startSync(mode: SyncMode, targetPath?: string) {
+		if (!this.checkConfig()) return;
+
 		if (this.isSyncing) {
 			new Notice("正在同步...(点击屏幕空白区域可以后台运行同步)");
 			return;
 		}
-		if (!this.checkConfig()) return;
 
-		this.isSyncing = true;
 		const progress = new ProgressModal(this.app);
 		progress.open();
 
@@ -154,6 +265,14 @@ export default class GitHubSyncPlugin extends Plugin {
 			// 3. 计算差异
 			progress.setMessage("计算差异...");
 			let diff = await computeDiff(local.files, remote.files, ignore);
+
+			// 新增：如果没有差异，说明已经是最新，重置 Dirty 状态
+			const hasChanges =
+				diff.toUpload.length > 0 ||
+				diff.toDelete.length > 0 ||
+				diff.toDownload.length > 0 ||
+				diff.toRemove.length > 0;
+
 			if (targetPath) {
 				diff = {
 					toUpload: diff.toUpload.filter((f) => f.path === targetPath),
@@ -162,6 +281,10 @@ export default class GitHubSyncPlugin extends Plugin {
 					toRemove: diff.toRemove.filter((f) => f.path === targetPath),
 					unchanged: diff.unchanged.filter((f) => f.path === targetPath),
 				};
+			}
+
+			if (!hasChanges && !targetPath) {
+				this.setDirty(false);
 			}
 
 			// 4. 生成智能同步计划(如需要)
@@ -323,6 +446,7 @@ export default class GitHubSyncPlugin extends Plugin {
 		toUpload: FileDiff[],
 		toDelete: FileDiff[]
 	) {
+		this.isSyncing = true;
 		const startNotice = new Notice(
 			`⬆️ 开始 Push，上传 ${toUpload.length}，删除 ${toDelete.length}...`,
 			0
@@ -361,10 +485,13 @@ export default class GitHubSyncPlugin extends Plugin {
 
 			startNotice.hide();
 			new Notice(`✅ Push 完成：上传 ${toUpload.length}，删除 ${toDelete.length}`);
+			await this.clearDirtyState(); // 新增：同步成功，重置状态
 		} catch (err) {
 			startNotice.hide();
 			console.error("Push error:", err);
 			new Notice(`❌ Push 出错: ${this.getErrorMessage(err)}`);
+		} finally {
+			this.isSyncing = false;
 		}
 	}
 
@@ -376,6 +503,9 @@ export default class GitHubSyncPlugin extends Plugin {
 		toDownload: FileDiff[],
 		toRemove: FileDiff[]
 	) {
+		this.isSyncing = true;
+		// 核心修复：加入冷却池，防止写入后延迟触发的 modify 事件被误判
+		toDownload.forEach(f => this.recentlySyncedPaths.add(f.path));
 		const startNotice = new Notice(
 			`⬇️ 开始 Pull，下载 ${toDownload.length}，删除 ${toRemove.length}...`,
 			0
@@ -402,10 +532,17 @@ export default class GitHubSyncPlugin extends Plugin {
 			new Notice(
 				`✅ Pull 完成：下载 ${toDownload.length}，删除 ${toRemove.length}`
 			);
+			await this.clearDirtyState(); // 新增：同步成功，重置状态
 		} catch (err) {
 			startNotice.hide();
 			console.error("Pull error:", err);
 			new Notice(`❌ Pull 出错: ${this.getErrorMessage(err)}`);
+		} finally {
+			this.isSyncing = false;
+			// 2秒后解除冷却
+			setTimeout(() => {
+				toDownload.forEach(f => this.recentlySyncedPaths.delete(f.path));
+			}, 2000);
 		}
 	}
 
@@ -421,6 +558,9 @@ export default class GitHubSyncPlugin extends Plugin {
 		uploads: FileDiff[],
 		downloads: FileDiff[]
 	) {
+		this.isSyncing = true;
+		downloads.forEach(f => this.recentlySyncedPaths.add(f.path));
+
 		const startNotice = new Notice(
 			`🔀 开始智能同步，上传 ${uploads.length}，下载 ${downloads.length}...`,
 			0
@@ -463,10 +603,16 @@ export default class GitHubSyncPlugin extends Plugin {
 			new Notice(
 				`✅ 智能同步完成：上传 ${uploads.length}，下载 ${downloads.length}`
 			);
+			await this.clearDirtyState();
 		} catch (err) {
 			startNotice.hide();
 			console.error("Smart sync error:", err);
 			new Notice(`❌ 智能同步出错: ${this.getErrorMessage(err)}`);
+		} finally {
+			this.isSyncing = false;
+			setTimeout(() => {
+				downloads.forEach(f => this.recentlySyncedPaths.delete(f.path));
+			}, 2000);
 		}
 	}
 
@@ -754,9 +900,12 @@ flex-shrink: 0;
   color: var(--text-normal);
 }
 
-.file-added    { color: #28a745; }
-.file-modified { color: #e6922a; }
-.file-deleted  { color: #dc3545; text-decoration: line-through; }
+/* 核心颜色语义重构 */
+.file-added    { color: #28a745; } /* 绿色：Push 新增 */
+.file-download { color: #28a745; } /* 绿色：Smart/Pull 下载 */
+.file-modified { color: #e6922a; } /* 橙色：内容修改 */
+.file-upload   { color: #0366d6; } /* 蓝色：Smart 上传 */
+.file-deleted  { color: #dc3545; text-decoration: line-through; } /* 红色：删除 */
 
 .github-sync-more {
   color: var(--text-muted);
@@ -779,10 +928,11 @@ flex-shrink: 0;
 }
 
 /* 进度条 */
-.github-sync-progress-modal {
-  text-align: center;
-  padding: 24px 16px;
-}
+.github-sync-progress-modal { text-align: center; padding: 24px 16px; }
+.github-sync-progress-msg { color: var(--text-muted); margin: 8px 0 20px; min-height: 1.4em; }
+.github-sync-progress-bar-wrap { width: 100%; height: 8px; background: var(--background-modifier-border); border-radius: 4px; overflow: hidden; }
+.github-sync-progress-bar-fill { height: 100%; background: var(--interactive-accent); border-radius: 4px; width: 0%; transition: width 0.3s ease; }
+
 
 .github-sync-progress-msg {
   color: var(--text-muted);

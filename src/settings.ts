@@ -7,14 +7,22 @@ export interface GitHubSyncSettings {
     branch: string;
     ignorePaths: string;  // 每行一个路径
     commitMessage: string;
+    // 新增：启动时警告开关
+	showUnsyncedWarningOnStartup: boolean;
+	// 新增：持久化状态（用于跨会话记录）
+	hasUnsyncedChanges: boolean;
+	lastUnsyncedPaths: string[];
 }
 
 export const DEFAULT_SETTINGS: GitHubSyncSettings = {
     token: '',
-    repository: '',
-    branch: 'main',
-    ignorePaths: '.obsidian/workspace.json',
-    commitMessage: 'obsidian sync {date}',
+	repository: '',
+	branch: 'main',
+	ignorePaths: '.obsidian/workspace.json',
+	commitMessage: 'obsidian sync {date}',
+	showUnsyncedWarningOnStartup: true,
+	hasUnsyncedChanges: false,
+	lastUnsyncedPaths: [],
 };
 
 export class GitHubSyncSettingTab extends PluginSettingTab {
@@ -82,6 +90,17 @@ export class GitHubSyncSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.commitMessage)
                 .onChange(async (value) => {
                     this.plugin.settings.commitMessage = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 新增：启动警告开关
+        new Setting(containerEl)
+            .setName('启动时提醒未同步状态')
+            .setDesc('如果上次退出时有未同步的修改，下次打开时弹窗提醒并列出文件，防止拉取时覆盖。')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.showUnsyncedWarningOnStartup)
+                .onChange(async (value) => {
+                    this.plugin.settings.showUnsyncedWarningOnStartup = value;
                     await this.plugin.saveSettings();
                 }));
     }
